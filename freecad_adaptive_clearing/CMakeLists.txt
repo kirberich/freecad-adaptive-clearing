@@ -88,4 +88,4 @@ target_link_libraries(_freecad_adaptive_clearing PRIVATE freecad_adaptive_cleari
 install(TARGETS _freecad_adaptive_clearing DESTINATION "${PYTHON_PACKAGE_DIR}")
 
 # Install Python sources and typing metadata alongside the .so (for pip install)
-install(FILES __init__.py gcode.py _freecad_adaptive_clearing.pyi py.typed DESTINATION "${PYTHON_PACKAGE_DIR}")
+install(FILES __init__.py _freecad_adaptive_clearing.pyi py.typed DESTINATION "${PYTHON_PACKAGE_DIR}")
