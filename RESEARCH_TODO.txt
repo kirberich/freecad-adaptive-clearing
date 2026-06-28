@@ -1,0 +1,885 @@
+The following are the required research tasks for extracting how adaptive clearing works in FreeCAD and to enable me to port the functionality to a separate program.
+
+1) Analyze the FreeCAD code to identify the files related to adaptive CAM operations. Summarize results below (one line per file: name of the file and its main function)
+
+    src/Mod/CAM/libarea/Adaptive.hpp — C++ header: defines Adaptive2d class, data structures (AdaptiveOutput, DPoint, DPath, TPath), enums (MotionType, OperationType), and all method signatures
+    src/Mod/CAM/libarea/Adaptive.cpp — C++ core implementation (~4000 lines): the full adaptive toolpath algorithm including Execute, ProcessPolyNode, FindEntryPoint, CalcCutArea, FindLinkPath, AppendToolPath, MakeLeadPath, ResolveLinkPath, ClearedArea class, Interpolation class, and geometry utilities
+    src/Mod/CAM/Path/Op/Adaptive.py — Python operation wrapper: PathAdaptive class, property definitions, Execute() that configures and calls C++ Adaptive2d, GenerateGCode() for G-code output, get_cleared_area() for rest machining, _get_working_edges() for boundary extraction
+    src/Mod/CAM/Path/Op/Gui/Adaptive.py — Python GUI panel: task panel UI for the adaptive operation, property bindings between UI controls and operation properties
+    src/Mod/CAM/CAMTests/TestPathAdaptive.py — Unit tests for the adaptive operation covering clearing inside/outside, profiling, and rest machining
+
+2) Summarize the general approach of how adaptive toolpaths work
+
+    The adaptive clearing algorithm implements constant-engagement trochoidal milling. Rather than using offset contours (which create variable tool engagement), it generates a single continuous spiral-like toolpath that maintains near-constant cutting engagement throughout.
+
+    High-level flow:
+
+    A. Preprocessing: The input boundary is offset inward by (toolRadius + finishingThickness) to create the tool boundary (the region the tool center can occupy). The boundary is further offset outward by toolRadius to create the bounds (the region that must be fully cleared). Connected components are identified by nesting level.
+
+    B. Per-region processing (ProcessPolyNode): For each connected region:
+       - Entry: Find an entry point (either via engagement from the edge or a helical ramp). The tool plunges into material.
+       - Pass loop: Generate a continuous cutting pass by stepping the tool forward in small increments. At each step, the algorithm tests candidate deflection angles, computes the cut area for each, and selects the angle that produces the target cut area per unit distance. The tool spirals inward/outward maintaining constant engagement.
+       - Engagement: After each pass, find the next uncleared area and generate a linking path to it (either tool-down linking through cleared material, or retract-and-rapid).
+       - Finishing: After all clearing passes, take a finishing profile pass along the boundary at a reduced stepover (1/10th of normal).
+
+    C. Postprocessing: The 2D toolpaths are converted to G-code with helical entry moves, Z-level stepping, and proper feed rates.
+
+    Key insight: The algorithm works entirely in 2D (XY plane). Z-level stepping is handled by the Python wrapper, which calls the C++ core once per Z-level.
+
+3) In detail, write down what inputs are required for the algorithm.
+
+    GEOMETRIC INPUTS:
+    ┌─────────────────────┬──────────────────────────┬──────────────────────────────────────────────────────┐
+    │ Input               │ Type                     │ Description                                          │
+    ├─────────────────────┼──────────────────────────┼──────────────────────────────────────────────────────┤
+    │ paths               │ list[list[(x,y)]]        │ 2D boundary polygon(s) of the region to machine.     │
+    │                     │                          │ Multiple polygons represent holes.                   │
+    ├─────────────────────┼──────────────────────────┼──────────────────────────────────────────────────────┤
+    │ stockPaths          │ list[list[(x,y)]]        │ 2D outline of the stock material boundary            │
+    ├─────────────────────┼──────────────────────────┼──────────────────────────────────────────────────────┤
+    │ clearedPaths        │ list[list[(x,y)]]        │ Pre-cleared areas (for rest machining).              │
+    │                     │                          │ Empty list if none.                                  │
+    └─────────────────────┴──────────────────────────┴──────────────────────────────────────────────────────┘
+
+    ALGORITHM PARAMETERS:
+    ┌─────────────────────────────┬─────────┬──────────────────┬──────────────────────────────────────────────┐
+    │ Parameter                   │ Type    │ Default          │ Description                                  │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ toolDiameter                │ float   │ 5.0              │ Diameter of the cutting tool (mm)            │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ stepOverFactor              │ float   │ 0.20             │ Fraction of tool diameter to step over       │
+    │                             │         │                  │ per pass (0.01–1.0)                          │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ tolerance                   │ float   │ 0.1              │ Accuracy vs. performance tradeoff            │
+    │                             │         │                  │ (0.01–1.0). Lower = more accurate but slower │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ stockToLeave                │ float   │ 0                │ Radial stock to leave for finishing (mm)     │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ helixRampTargetDiameter     │ float   │ =toolDiameter    │ Target diameter for helical entry (mm)       │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ helixRampMinDiameter        │ float   │ =toolDiameter/8  │ Minimum acceptable helix diameter (mm)       │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ forceInsideOut              │ bool    │ true             │ If true, force plunging inside material and  │
+    │                             │         │                  │ clearing outward. If false, allow cutting    │
+    │                             │         │                  │ from outside stock.                          │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ finishingProfile            │ bool    │ true             │ Whether to take a finishing profile pass     │
+    │                             │         │                  │ at the end                                   │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ opType                      │ enum    │ ClearingInside   │ One of: ClearingInside, ClearingOutside,     │
+    │                             │         │                  │ ProfilingInside, ProfilingOutside            │
+    ├─────────────────────────────┼─────────┼──────────────────┼──────────────────────────────────────────────┤
+    │ keepToolDownDistRatio       │ float   │ 3.0              │ Max ratio of tool-down link length to        │
+    │                             │         │                  │ direct distance (controls retraction freq.)  │
+    └─────────────────────────────┴─────────┴──────────────────┴──────────────────────────────────────────────┘
+
+    DERIVED INTERNAL PARAMETERS (computed from inputs):
+    ┌──────────────────────┬──────────────────────────────────────────────────────────────────────────┐
+    │ Parameter            │ Formula                                                                  │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ scaleFactor          │ MIN_STEP_CLIPPER / tolerance / min(1.0, stepOverFactor * toolDiameter)   │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ toolRadiusScaled     │ toolDiameter * scaleFactor / 2                                           │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ stepOverScaled       │ toolRadiusScaled * stepOverFactor                                        │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ finishPassOffsetScaled│ stepOverScaled / 10  (if finishing enabled)                             │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ optimalCutAreaPD     │ 2 * stepOverFactor * referenceCutArea / toolRadiusScaled                 │
+    │                      │ (target cut area per unit distance traveled)                             │
+    └──────────────────────┴──────────────────────────────────────────────────────────────────────────┘
+
+    OUTPUT (per region, AdaptiveOutput struct):
+    ┌──────────────────────┬──────────────────────────────────────────────────────────────────────────┐
+    │ Field                │ Description                                                              │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ HelixCenterPoint     │ (x, y) center of helical entry                                           │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ StartPoint           │ (x, y) where cutting begins                                              │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ AdaptivePaths        │ list of (MotionType, list of (x,y) points) — the generated toolpath      │
+    │                      │ MotionType: Cutting=0, LinkClear=1, LinkNotClear=2                       │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ ReturnMotionType     │ MotionType for return-to-start move                                      │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ ClearedArea          │ Total area cleared in this operation (mm²)                               │
+    ├──────────────────────┼──────────────────────────────────────────────────────────────────────────┤
+    │ Error flags (bools)  │ StartPointNotFound, LeadPathFailed, UnexpectedRotateIterations,          │
+    │                      │ TooManyFailedEngagements, UnclearedAreaRemains,                          │
+    │                      │ FailedToSetUpFinishingPass, FinishingLeadInFailed                        │
+    └──────────────────────┴──────────────────────────────────────────────────────────────────────────┘
+
+4) Write an accurate pseudo-code description of how adaptive toolpaths are generated
+
+    ═══════════════════════════════════════════════════════════════
+    ADAPTIVE CLEARING ALGORITHM — PSEUDO-CODE
+    ═══════════════════════════════════════════════════════════════
+
+    CONSTANTS:
+        MIN_STEP_CLIPPER = 48          // minimum step size in scaled units
+        MAX_ITERATIONS = 30            // max angle-search iterations per step
+        AREA_ERROR_FACTOR = 0.05       // 5% tolerance on target cut area
+        FINISHING_THICKNESS_SCALE = 0.1 // finishing pass at 1/10 stepover
+        ANGLE_HISTORY_POINTS = 3       // for angle prediction
+        DIRECTION_SMOOTHING_BUFLEN = 3 // gyro smoothing buffer
+
+    ═══════════════════════════════════
+    FUNCTION Execute(stockPaths, paths, clearedPaths, progressCallback)
+    ═══════════════════════════════════
+
+        // 1. INITIALIZATION
+        scaleFactor = MIN_STEP_CLIPPER / tolerance / min(1.0, stepOverFactor * toolDiameter)
+        toolRadiusScaled = toolDiameter * scaleFactor / 2
+        stepOverScaled = toolRadiusScaled * stepOverFactor
+        finishPassOffsetScaled = finishingProfile ? stepOverScaled * FINISHING_THICKNESS_SCALE : 0
+
+        // Compute reference cut area from tool geometry
+        toolGeometry = circle of radius toolRadiusScaled
+        referenceCutArea = area of intersection of two tool circles offset by toolRadiusScaled/2
+        optimalCutAreaPD = 2 * stepOverFactor * referenceCutArea / toolRadiusScaled
+        // "optimalCutAreaPD" = target cut area per unit distance traveled
+
+        // 2. CONVERT INPUT PATHS TO SCALED INTEGER COORDINATES
+        inputPaths = scale all paths by scaleFactor, clean, deduplicate, connect, simplify
+        stockInputPaths = scale stock paths by scaleFactor
+        initialClearedPaths = scale cleared paths by scaleFactor
+
+        // 3. APPLY STOCK TO LEAVE
+        offset inputPaths by ±stockToLeave (inward for inside, outward for outside)
+
+        // 4. HANDLE OPERATION TYPE
+        if opType == ClearingOutside:
+            add stockInputPaths to inputPaths
+
+        Fix all input path orientations (outer CCW, inner CW)
+        Tag all input path vertices with Z=1 (needs finishing)
+
+        if opType is Profiling:
+            // Convert profile paths to area paths by offsetting by
+            // ±(2*toolRadius + 2*helixRadius + finishingThickness)
+            // Union with original paths; new paths tagged Z=0 (no finishing needed)
+
+        // 5. HANDLE OUTSIDE-IN CLEARING (if !forceInsideOut)
+        if not forceInsideOut:
+            Create region outside stock boundary
+            Union inputPaths with outside-of-stock region
+            Update initialClearedPaths similarly
+
+        // 6. COMPUTE TOOL BOUNDARY
+        toolBounds = offset(inputPaths, -(toolRadiusScaled + finishPassOffsetScaled))
+        // This is the region the tool center can occupy
+
+        // 7. PROCESS EACH CONNECTED REGION
+        for each exterior boundary in toolBounds (nesting level odd):
+            currentTBP = [exterior] + all holes directly inside it
+
+            // 8. COMPUTE FINISHING PATHS
+            finishingPass = offset(currentTBP, finishPassOffsetScaled)
+            // Only paths with Z=1 vertices need finishing
+
+            // 9. COMPUTE BOUNDS (region that must be cleared)
+            boundPath = offset(currentTBP, toolRadiusScaled - 3)
+
+            // Skip if bounds already fully cleared
+            if boundPath is fully covered by initialClearedPaths:
+                continue
+
+            // 10. RUN CORE ALGORITHM
+            ProcessPolyNode(boundPath, currentTBP, finishingPass, initialClearedPaths)
+
+        return results
+
+
+    ═══════════════════════════════════
+    FUNCTION ProcessPolyNode(boundPaths, toolBoundPaths, finishingPaths, initialClearedPaths)
+    ═══════════════════════════════════
+
+        // Initialize cleared area tracker
+        cleared = new ClearedArea(toolRadiusScaled)
+        cleared.SetClearedPaths(initialClearedPaths)
+
+        // Shrink toolBoundPaths slightly for safety margin
+        tbpMinus = offset(toolBoundPaths, -2)
+
+        // FIND ENTRY POINT
+        // Try engagement from edge first, fall back to helical entry
+        engagePoint = getEngagePoint(null)  // null = no previous position
+        if engagePoint found:
+            toolPos, toolDir, linkPath = engagePoint
+            entryPoint = start of linkPath
+        else:
+            // Helical entry: find largest circle that fits in uncleared area
+            FindEntryPoint(...)
+            if not found: return  // region cannot be entered
+
+        // MAIN PASS LOOP
+        for pass = 0 to PASSES_LIMIT:
+            if stopProcessing: break
+
+            // Include linking path in cleared area
+            cleared.ExpandCleared(linkPath)
+
+            // Reset per-pass state
+            passToolPath = []
+            angleHistory = [0]
+            gyro = [toolDir, toolDir, toolDir]  // direction smoothing buffer
+            angle = π/4  // initial deflection
+
+            // POINT LOOP — generate one continuous cutting pass
+            for point_index = 0 to POINTS_PER_PASS_LIMIT:
+                if stopProcessing: break
+
+                // Smooth tool direction using gyro average
+                toolDir = average(gyro)
+
+                // ITERATE TO FIND NEXT TOOL POSITION
+                result = iterateNextStep(toolPos, toolDir)
+                // (see iterateNextStep below)
+
+                if result.failed:
+                    break  // end of this pass
+
+                // Record the step
+                angleHistory.append(result.iterationAngle)
+                if angleHistory.size > ANGLE_HISTORY_POINTS:
+                    angleHistory.pop_front()
+
+                // Periodically expand cleared area when direction changes significantly
+                if direction changed > 45° from last expand:
+                    cleared.ExpandCleared(toClearPath)
+                    toClearPath = []
+
+                toClearPath.append(toolPos)
+                toClearPath.append(result.newToolPos)
+
+                passToolPath.append(toolPos)
+                passToolPath.append(result.newToolPos)
+
+                toolPos = result.newToolPos
+                gyro.append(result.newToolDir)
+                gyro.pop_front()
+
+                ReportProgress()
+
+            // End of pass — finalize cleared area
+            cleared.ExpandCleared(toClearPath)
+
+            // Compute cumulative cut area for this pass
+            newlyCleared = cleared.GetCleared() - clearedBeforePass
+            cumulativeCutArea = area(newlyCleared)
+
+            if cumulativeCutArea >= 1:
+                // Clean and output the pass toolpath
+                CleanPath(passToolPath)
+                AppendToolPath(output, passToolPath, linkPath, cleared, toolBoundPaths)
+                bad_engage_count = 0
+            else:
+                bad_engage_count++
+                if bad_engage_count > 10000:
+                    output.TooManyFailedEngagements = true
+                    break
+
+            // Find next engagement point
+            clearedBeforePass = copy of cleared
+            engagePoint = getEngagePoint(toolPos)
+            if engagePoint found:
+                toolPos, toolDir, linkPath = engagePoint
+            else:
+                // Check if any uncleared area remains
+                if no significant uncleared area remains:
+                    break  // All cleared!
+                else:
+                    output.UnclearedAreaRemains = true
+                    break
+
+        // SANITY CHECK: verify finishing pass won't be too heavy
+        uncut = toolBoundPaths - (cleared - toolRadiusScaled)
+        if uncut is not empty:
+            output.FailedToSetUpFinishingPass = true
+
+        // FINISHING PASS
+        if finishingProfile:
+            // Update toolBoundPaths to finishing path positions
+            toolBoundPaths = offset(finishingPaths, ±3)
+
+            // Split finishing paths into closed (all Z=1) and open (partial Z=1)
+            closedFinishingPaths, openFinishingPaths = split by Z values
+
+            while finishing paths remain:
+                // Pop closest finishing pass to current tool position
+                isClosed = PopNextFinishingPass(
+                    closedFinishingPaths, openFinishingPaths, toolPos, finPath
+                )
+
+                // Skip passes outside stock boundary
+                if finPath does not intersect stock: continue
+
+                // Clean path
+                CleanPath(finPath)
+
+                // Generate lead-in
+                linkPath = FindLinkPath(
+                    toolPos, finPath[0], finPath direction, cleared, toolBoundPaths
+                )
+                if linkPath failed:
+                    output.FinishingLeadInFailed = true
+                    continue
+
+                // Append finishing path
+                AppendToolPath(output, finPath, linkPath, cleared, toolBoundPaths)
+                cleared.ExpandCleared(finPath)
+
+            // Generate return path to entry point
+            returnPath = [toolPos, entryPoint]
+            output.ReturnMotionType = IsClearPath(returnPath) ? LinkClear : LinkNotClear
+
+        // Compute total cleared area
+        output.ClearedArea = (finalClearedArea - initialClearedArea) / scaleFactor²
+
+        results.append(output)
+
+
+    ═══════════════════════════════════
+    FUNCTION iterateNextStep(toolPos, toolDir)
+    ═══════════════════════════════════
+        // This is the core of the constant-engagement algorithm.
+        // It finds the next tool position by testing candidate deflection
+        // angles and selecting the one that produces the target cut area.
+
+        // 1. Compute distance to boundary and engagement point
+        distanceToBoundary = min distance from toolPos to toolBoundPaths
+        distanceToEngage = distance from toolPos to entryPoint
+
+        // 2. Set adaptive step size
+        if near boundary or near entry point:
+            stepScaled = MIN_STEP_CLIPPER          // slow down
+        else if turning:
+            stepScaled = MIN_STEP_CLIPPER / |angle| // smaller steps in tight turns
+        else:
+            stepScaled = MIN_STEP_CLIPPER * 8       // cruise speed
+
+        // Clamp step size
+        stepScaled = clamp(stepScaled, MIN_STEP_CLIPPER, min(toolRadius/4, MIN_STEP_CLIPPER*8))
+
+        // 3. ANGLE ITERATION — find the right deflection angle
+        predictedAngle = average(angleHistory)  // from previous steps
+        interp = new Interpolation()            // tracks angle-vs-error pairs
+        foundArea = false
+
+        for iteration = 0 to MAX_ITERATIONS:
+            if iteration == 0:
+                angle = predictedAngle          // try predicted angle first
+            elif iteration == 1:
+                angle = interp.MIN_ANGLE (-π/4) // max engagement (turn left hard)
+            elif iteration == 2:
+                if interp has points on both sides of target:
+                    angle = interp.interpolateAngle()  // binary search
+                else:
+                    angle = interp.MAX_ANGLE (+π/4)    // min engagement (turn right hard)
+            elif iteration == 3 and not foundArea:
+                // EXPAND: no cut found in any direction — expand cleared area
+                cleared.ExpandCleared(toClearPath)
+                // Search forward for uncleared area
+                triangle = cone in front of tool
+                uncleared = triangle - cleared
+                if uncleared is empty: continue
+                // Find closest uncleared point and steer toward it
+                angle = angle toward closest uncleared point
+            elif not foundArea:
+                angle = 0; area = 0; break  // give up
+            else:
+                angle = interp.interpolateAngle()  // continue binary search
+
+            angle = clamp(angle, -π/4, +π/4)
+
+            // Compute candidate position
+            newToolDir = rotate(toolDir, angle)
+            newToolPos = toolPos + newToolDir * stepScaled
+
+            // Skip if this integer position was already tested
+            if duplicate position: continue
+
+            // COMPUTE CUT AREA for this candidate
+            area, conventionalArea = CalcCutArea(toolPos, newToolPos, cleared)
+            if area > 0: foundArea = true
+
+            areaPD = area / stepScaled           // area per distance
+            error = areaPD - optimalCutAreaPD    // error from target
+            isConventional = (conventionalArea / area) >= 0.51
+
+            interp.addPoint(error, {angle, newToolPos}, isConventional)
+
+            // Accept if error is within tolerance AND not conventional milling
+            if |error| < AREA_ERROR_FACTOR * optimalCutAreaPD and not isConventional:
+                break
+
+        // 4. BOUNDARY CHECK — rotate back inside if outside
+        if newToolPos is outside toolBoundPaths:
+            rotateStep = 0
+            while newToolPos outside and rotateStep < 180:
+                rotate newToolDir toward boundary direction by π/90
+                newToolPos = toolPos + newToolDir * stepScaled
+                rotateStep++
+            if rotateStep >= 180:
+                return FAILED
+            recalculate area for new position
+
+        // 5. SAFETY CHECKS
+        if area > stepScaled * optimalCutAreaPD and areaPD > 2 * optimalCutAreaPD:
+            return FAILED  // over-cut protection
+
+        if isConventional or area < 1:
+            return FAILED  // reject conventional milling / zero cut
+
+        return { newToolPos, newToolDir, area, errorFraction, iterationAngle }
+
+
+    ═══════════════════════════════════
+    FUNCTION CalcCutArea(toolPos1, toolPos2, clearedArea)
+    ═══════════════════════════════════
+        // Compute the area of material cut when the tool moves from
+        // toolPos1 to toolPos2, accounting for already-cleared material.
+        //
+        // Returns: (totalCutArea, conventionalCutArea)
+        //   - totalCutArea: area of new material cut
+        //   - conventionalCutArea: portion cut on the "conventional" side
+        //     (behind the tool center, i.e., x < toolPos2.X in rotated frame)
+
+        if distance(toolPos1, toolPos2) < NTOL:
+            return (0, 0)
+
+        // 0. Get nearby cleared polygons (bounded by tool radius + step distance)
+        polygons = clearedArea.GetBoundedClearedAreaClipped(
+            toolPos2, toolRadius + dist + 4
+        )
+
+        // 0.5. Rotate all geometry so toolPos1→toolPos2 points up (+Y)
+        rotate everything by (π/2 - atan2(dy, dx))
+
+        // 1. Collect all X-coordinates of interest:
+        xs = []
+        for each polygon:
+            xs += all polygon vertex X coordinates
+            xs += intersections of polygon edges with circle at toolPos1
+            xs += intersections of polygon edges with circle at toolPos2
+        xs += intersections of the two tool circles with each other
+        xs += toolPos1.X ± toolRadius  (vertical tangents)
+        xs += toolPos2.X ± toolRadius
+        xs += toolPos2.X
+
+        // 2. Filter to [toolPos2.X - toolRadius, toolPos2.X + toolRadius] and sort
+        xs = filter and sort xs
+
+        // 3. For each X-interval, integrate area using vertical line sweep
+        area = 0
+        conventionalArea = 0
+        for each adjacent pair (x0, x1) in xs:
+            if x0 == x1: continue
+            xtest = (x0 + x1) / 2  // midpoint
+
+            // 3a. Find all Y-intersections of vertical line at xtest with:
+            //     - polygon edges
+            //     - circle at toolPos1 (top/bottom)
+            //     - circle at toolPos2 (top/bottom)
+            ys = []
+            for each polygon edge crossing xtest:
+                ys += interpolated Y at xtest
+            for each circle (toolPos2, toolPos1):
+                if |xtest - center.X| < toolRadius:
+                    ys += center.Y ± sqrt(toolRadius² - (xtest - center.X)²)
+
+            // 3b. Sort Y-intersections
+            sort ys by Y
+
+            // 3c. Sweep Y from bottom to top, tracking inside/outside state
+            outside = [true, true, ..., false, true]  // initially outside all shapes except c2
+            outsideCount = 1  // start outside c2
+            for each (y, shapeIndex, partIndex) in ys:
+                prevOutside = outside[shapeIndex]
+                outside[shapeIndex] = !outside[shapeIndex]
+                outsideCount += prevOutside ? -1 : 1
+
+                sign = prevOutside ? -1 : 1  // entrance = -1, exit = +1
+
+                if outsideCount == 0 or prevCount == 0:
+                    // We are entering or leaving the cut region
+                    if shapeIndex is a polygon:
+                        // Trapezoid area between x0 and x1
+                        y0 = interpolate polygon edge at x0
+                        y1 = interpolate polygon edge at x1
+                        newArea = (y0 + y1) / 2 * (x1 - x0)
+                        area += sign * newArea
+                        if xtest < toolPos2.X:
+                            conventionalArea += sign * newArea
+                    else:  // shapeIndex is a circle
+                        // Circle segment area + trapezoid to axis
+                        phi0 = acos((x0 - center.X) / toolRadius) * circleSign
+                        phi1 = acos((x1 - center.X) / toolRadius) * circleSign
+                        areaSector = toolRadius² / 2 * |phi1 - phi0|
+                        areaTriangle = base * height / 2
+                        areaSegment = areaSector - areaTriangle
+                        areaTrapezoid = (x1 - x0) * (y0 + y1) / 2
+                        newArea = circleSign * areaSegment + areaTrapezoid
+                        area += sign * newArea
+                        if xtest < toolPos2.X:
+                            conventionalArea += sign * newArea
+
+        return (area, conventionalArea)
+
+
+    ═══════════════════════════════════
+    FUNCTION getEngagePoint(prevPos)
+    ═══════════════════════════════════
+        // Find the next position to engage with uncleared material
+
+        // Compute desired engagement protrusion
+        targetArea = optimalCutAreaPD * MIN_STEP_CLIPPER
+        theta = (12 * targetArea / toolRadius²)^(1/3)
+        protrusion = toolRadius - cos(theta/2) * toolRadius
+        engagementProtrusion = min(protrusion, stepOverScaled * FINISHING_THICKNESS_SCALE)
+
+        // Find candidate engagement positions:
+        // 1. Offset cleared area inward by -(toolRadius + buffer)
+        // 2. Offset result outward by (buffer + engagementProtrusion)
+        //    → This gives paths that protrude into uncleared material
+        preEngage = offset(cleared, -(toolRadius + 2))
+        engagePaths = offset(preEngage, 2 + engagementProtrusion)
+
+        // 3. Clip engagePaths with toolBoundPaths
+        // 4. For each resulting open path, step along it at MIN_STEP_CLIPPER intervals
+        // 5. At each step, test if tool can cut from that position using initToolDir()
+        // 6. Collect valid (position, direction, linkCost) tuples
+
+        // Sort candidates by link cost (distance from prevPos)
+        sort engagePoints by cost
+
+        // Try each candidate, generating link path
+        for each candidate in engagePoints:
+            linkPath = FindLinkPath(
+                prevPos, candidate.pos, candidate.dir, cleared, toolBoundPaths
+            )
+            if linkPath found:
+                compute total cost (link distance + penalty for retractions)
+                if cost < bestCost:
+                    bestCost = cost
+                    bestResult = {candidate.pos, candidate.dir, linkPath}
+
+        if bestResult found:
+            // Update cleared area with cutting portions of link path
+            for each cutting segment in linkPath:
+                cleared.ExpandCleared(segment)
+            return bestResult
+        else:
+            return null  // no engagement found
+
+
+    ═══════════════════════════════════
+    FUNCTION FindLinkPath(prevPoint, pathStart, pathDir, cleared, toolBoundPaths)
+    ═══════════════════════════════════
+        // Generate a linking path from prevPoint to pathStart,
+        // including a lead-in that approaches pathStart along pathDir
+
+        if link distance is very short:
+            return simple direct path
+
+        // 1. PLAN LEAD-IN (as reverse lead-out from pathStart)
+        beaconOffset = max(min(stepOverScaled, linkDist/2) * 1.5, 8 * MIN_STEP_CLIPPER)
+        endBeacon = pathStart + beaconOffset
+                    * direction between reverse pathDir and boundary normal
+        leadInPath = MakeLeadPath(
+            leadIn=true, pathStart, -pathDir, endBeacon, cleared, toolBoundPaths
+        )
+        ReversePath(leadInPath)  // now goes toward pathStart
+
+        if leadInPath failed:
+            return null
+
+        // 2. COMPUTE LINKING PATH from prevPoint to leadInPath start
+        if prevPoint exists:
+            if ResolveLinkPath(prevPoint, leadInPath[0], cleared, linkPath):
+                // Tool-down link found through cleared material
+                linkType = LinkClear
+                // Extend lead-in backward along link path for smoother entry
+                trim end of linkPath, prepend to leadInPath
+            else:
+                // No tool-down link — check if short cut-through is acceptable
+                linkType = LinkNotClear
+                if distance < 2 * stepOverScaled and cut area is acceptable:
+                    linkType = Cutting  // short cut-through allowed
+                linkPath = [prevPoint, leadInPath[0]]  // direct line
+
+        // 3. SMOOTH PATHS
+        SmoothPaths([linkPath, leadInPath], 0.1 * stepOverScaled)
+
+        // 4. OUTPUT
+        result = []
+        if prevPoint: result.append({linkType, linkPath})
+        result.append({Cutting, leadInPath})
+        return result
+
+
+    ═══════════════════════════════════
+    FUNCTION MakeLeadPath(leadIn, startPoint, startDir, beaconPoint, cleared, toolBoundPaths)
+    ═══════════════════════════════════
+        // Generate a lead-in or lead-out path from startPoint toward beaconPoint
+        // that stays within cuttable material and ends in cleared area
+
+        stepSize = min(MIN_STEP_CLIPPER * 8, 0.2 * stepOverScaled + 1)
+
+        // Compute acceptable end locations (inside cleared area, offset by toolRadius)
+        acceptableEnds = offset(cleared, -(toolRadius + stepSize))
+        if acceptableEnds is empty: return false
+
+        // Move beacon into acceptable region if needed
+        if beaconPoint not inside acceptableEnds:
+            beaconPoint = closest point on acceptableEnds
+
+        currentPoint = startPoint
+        targetDir = direction from currentPoint to beaconPoint
+        nextDir = startDir
+        pathLen = 0
+        clearedStartLen = null
+
+        for i = 0 to 10000:
+            nextPoint = currentPoint + nextDir * stepSize
+
+            if IsAllowedToCutThrough(currentPoint, nextPoint, cleared, toolBoundPaths):
+                // For lead-out: update cleared area as we go
+                if not leadIn:
+                    cleared.ExpandCleared(path so far)
+
+                output.append(nextPoint)
+                currentPoint = nextPoint
+                pathLen += stepSize
+
+                // Steer toward beacon (adaptive factor 0.4)
+                targetDir = direction to beaconPoint
+                nextDir = normalize(nextDir + 0.4 * targetDir)
+
+                // Check if we've reached cleared area
+                if currentPoint inside acceptableEnds:
+                    if not clearedStartLen:
+                        clearedStartLen = pathLen
+                    if pathLen > minExitLength
+                       and pathLen - clearedStartLen > MIN_STEP_CLIPPER:
+                        return true  // success!
+                else:
+                    clearedStartLen = null
+
+                // Overtravel check
+                if pathLen > maxLength:
+                    if currentPoint inside cleared:
+                        return true
+                    else:
+                        return false  // failed
+            else:
+                // Rotate direction to find clear path
+                nextDir = rotate(nextDir, leadIn ? -π/64 : +π/64)
+
+        return false
+
+
+    ═══════════════════════════════════
+    FUNCTION ResolveLinkPath(startPoint, endPoint, cleared, output)
+    ═══════════════════════════════════
+        // Find a tool-down linking path through already-cleared material
+        // Uses recursive midpoint subdivision with obstacle avoidance
+
+        queue = [(startPoint, endPoint)]
+        linkPaths = []
+        scanStep = clamp(2 * MIN_STEP_CLIPPER, 0.01*scaleFactor, 0.1*scaleFactor)
+        clearance = stepOverScaled
+
+        while queue not empty:
+            (p1, p2) = queue.pop()
+
+            // Check if direct path is clear
+            checkPath = [p1, p2] (with clearance offsets at start/end)
+            if IsClearPath(checkPath, cleared, clearance):
+                totalLength += distance(p1, p2)
+                if totalLength > keepToolDownDistRatio * directDistance:
+                    return false  // path too long
+                linkPaths.append([p1, p2])
+            else:
+                if distance(p1, p2) < 4:
+                    return false  // segment too short, still blocked
+
+                // Subdivide: search perpendicular to direct path for clear midpoint
+                perpDir = perpendicular to (p1→p2)
+                midPoint = (p1 + p2) / 2
+                for offset = scanStep, 2*scanStep, 3*scanStep, ...:
+                    testPoint1 = midPoint + offset * perpDir
+                    testPoint2 = midPoint - offset * perpDir
+
+                    // Pick the side closer to cleared area
+                    if testPoint1 is clear:
+                        queue.append((p1, testPoint1))
+                        queue.append((testPoint1, p2))
+                        break
+                    elif testPoint2 is clear:
+                        queue.append((p1, testPoint2))
+                        queue.append((testPoint2, p2))
+                        break
+
+                    if offset > keepToolDownDistRatio * directDistance:
+                        return false
+
+        // Connect and return
+        ConnectPaths(linkPaths)
+        output = linkPaths[0]
+        return true
+
+
+    ═══════════════════════════════════
+    FUNCTION FindEntryPoint(progressPaths, toolBoundPaths, boundPaths, cleared, ...)
+    ═══════════════════════════════════
+        // Find a helical entry point when edge engagement is not possible
+
+        // Compute remaining uncleared area
+        checkPaths = toolBoundPaths - cleared
+
+        for iter = 0 to 10:
+            // Offset inward until paths vanish; use last valid offset
+            lastValidOffset = innermost offset of checkPaths that still has area
+            entryPoint = centroid of lastValidOffset polygon
+
+            // Verify entry point is not in a hole
+            if entryPoint is in a hole:
+                found = false
+
+            // Check if minimum helix fits
+            if not checkHelixFit(helixRampMinRadius):
+                found = false
+            else:
+                // Binary search for largest helix that fits
+                minSize = helixRampMinRadius
+                maxSize = helixRampMaxRadius
+                while minSize < maxSize:
+                    testSize = (minSize + maxSize + 1) / 2
+                    if checkHelixFit(testSize):
+                        minSize = testSize
+                    else:
+                        maxSize = testSize - 1
+                helixRadius = minSize
+                cleared.AddClearedPaths(helix circle area)
+
+            if found: break
+
+            // Break symmetry and try again (take bottom-left quadrant)
+            checkPaths = checkPaths ∩ bottom-left quadrant of bounds
+
+        if found:
+            toolPos = (entryPoint.X, entryPoint.Y - helixRadius)
+            toolDir = (1, 0)  // pointing right
+        return found
+
+
+    ═══════════════════════════════════
+    FUNCTION AppendToolPath(output, passToolPath, linkPath, cleared, toolBoundPaths)
+    ═══════════════════════════════════
+        // Add a completed pass to the output, with lead-out
+
+        // 1. Append link path segments to output
+        for each segment in linkPath:
+            output.AdaptivePaths.append(segment)
+
+        // 2. Append cutting path
+        output.AdaptivePaths.append({Cutting, scaled passToolPath})
+
+        // 3. Generate lead-out
+        if passToolPath has >= 2 points:
+            prevPoint = last point of passToolPath
+            prevDir = direction of last segment
+
+            // Compute beacon (target for lead-out)
+            distToBounds = distance to toolBoundPaths
+            beaconOffset = max(min(stepOverScaled, pathLen/2) * 1.5, 8 * MIN_STEP_CLIPPER)
+            beaconDir = prevDir rotated 90° toward boundary
+            beacon = prevPoint + beaconOffset * beaconDir
+
+            leadOutPath = MakeLeadPath(
+                false, prevPoint, prevDir, beacon, cleared, toolBoundPaths
+            )
+            if leadOutPath succeeded:
+                SmoothPaths(leadOutPath)
+                output.AdaptivePaths.append({Cutting, scaled leadOutPath})
+                cleared.ExpandCleared(leadOutPath)
+                return (leadOutPath end, leadOutPath end direction)
+
+        return null
+
+
+    ═══════════════════════════════════
+    HELPER: IsClearPath(path, cleared, safetyClearance)
+    ═══════════════════════════════════
+        // Check if a path is entirely within cleared material
+        toolShape = offset path by (toolRadius + safetyClearance) with round caps
+        crossing = toolShape - cleared
+        return area(crossing) < 1.0
+
+
+    ═══════════════════════════════════
+    HELPER: IsAllowedToCutThrough(p1, p2, cleared, toolBoundPaths, areaFactor=1.5)
+    ═══════════════════════════════════
+        // Check if cutting from p1 to p2 is acceptable
+        // (used for short linking cuts through uncleared material)
+
+        if p1 or p2 outside toolBoundPaths: return false
+
+        distance = |p1 - p2|
+        if distance < stepSize/2: return true  // negligible
+
+        // Step along the path and check cut area at each sub-step
+        stepSize = min(0.5 * stepOverScaled, 8 * MIN_STEP_CLIPPER)
+        for each sub-step from p1 to p2:
+            area = CalcCutArea(stepStart, stepEnd, cleared).first
+            if area > areaFactor * stepSize * optimalCutAreaPD:
+                return false  // too much engagement
+            if stepEnd outside toolBoundPaths:
+                return false
+
+        return true
+
+
+    ═══════════════════════════════════════════════════════════════
+    SUMMARY OF KEY ALGORITHMIC CONCEPTS
+    ═══════════════════════════════════════════════════════════════
+
+    1. Constant engagement: The algorithm targets a specific cut area per unit distance
+       (optimalCutAreaPD), derived from the tool geometry and stepover. At each step, it
+       searches for a deflection angle that produces this target engagement.
+
+    2. Angle search via interpolation: Rather than brute-force testing angles, the algorithm
+       uses an Interpolation class that tracks angle-vs-error pairs and performs a modified
+       binary search, converging in ~3–5 iterations typically.
+
+    3. Clipper library: All geometric operations (offsets, unions, differences,
+       point-in-polygon) use the Clipper/Clipper2 polygon clipping library. Coordinates are
+       scaled to integers for robust computation.
+
+    4. Cleared area tracking: The ClearedArea class maintains the union of all tool-swept
+       regions, with bounding-box caching for performance. The ExpandCleared method unions a
+       new tool path (offset by tool radius) into the cleared set.
+
+    5. Climb vs. conventional milling: The algorithm explicitly rejects conventional milling
+       (where the tool rotates against the feed direction, producing the cut on the "back"
+       side). It tracks the "conventional area" fraction and rejects steps where it exceeds 51%.
+
+    6. Lead-in/lead-out: MakeLeadPath generates smooth entry/exit paths that steer the tool
+       from cleared material into the cut (or vice versa), using an adaptive steering factor
+       of 0.4 toward a beacon point.
+
+    7. Finishing pass: After clearing, a profile pass at 1/10th normal stepover cleans up the
+       boundary. The Z=1 tagging system tracks which boundary segments need finishing (original
+       geometry) vs. which don't (profiling-generated interior edges).
+
+    8. Tool-down linking: ResolveLinkPath finds a path through already-cleared material using
+       recursive midpoint subdivision, avoiding retractions when possible. Falls back to
+       retract-and-rapid (LinkNotClear) if no tool-down path exists within the distance ratio
+       limit.
+
+    9. Adaptive step size: The step size varies dynamically: small near boundaries and during
+       tight turns (MIN_STEP_CLIPPER), up to 8× larger when cruising in open areas.
+
+    10. Direction smoothing: A gyro buffer of the last 3 tool directions is averaged to
+        produce smooth, stable tool motion rather than jerky angle-by-angle stepping.
