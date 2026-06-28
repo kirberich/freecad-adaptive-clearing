@@ -1,5 +1,8 @@
 # FreeCAD's adaptive clearing algorithm as a standalone python library
 
+Allows access for FreeCAD's adaptive clearing algorithm without having to build the entirety of FreeCAD or rely on specific pre-installed python bindings.
+NOTE: If you have FreeCAD installed and you're happy to use the same python version, you can simply use FreeCAD's built-in bindings directly. I only created this because packaging and versioning difficulties made it easier to only compile the required parts of FreeCAD on demand.
+
 This repo is a fork of FreeCAD for simplicity's sake, but no change to FreeCAD are made in here. See README_FREECAD.md for FreeCAD's original readme.
 
 The only difference to FreeCAD is the freecad_adaptive_clearing folder which contains the python bindings.
