@@ -1,0 +1,36 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.12",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "freecad_adaptive_clearing"
+version = "1.0.0"
+description = "Adaptive clearing (trochoidal milling) toolpath generation — standalone Python bindings for FreeCAD's algorithm"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "LGPL-2.1-or-later" }
+authors = [
+    { name = "freecad_adaptive_clearing contributors" },
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: GNU Lesser General Public License v2 (LGPLv2)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.scikit-build]
+# The CMakeLists.txt is in the same directory
+cmake.args = ["-DCMAKE_BUILD_TYPE=Release"]
+
+[tool.scikit-build.wheel]
+# Only include the python files we care about (the .so is handled by install())
+packages = ["freecad_adaptive_clearing"]

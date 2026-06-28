@@ -1,0 +1,6 @@
+build/
+_freecad_adaptive_clearing*.so
+*.pyc
+__pycache__/
+*.egg-info/
+dist/

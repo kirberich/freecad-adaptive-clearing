@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "adaptive-clearing-test"
+version = "0.1.0"
+description = ""
+authors = ["Rob Kirberich <robert@kirberich.de>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+freecad-adaptive-clearing = {path = "../freecad_adaptive_clearing"}
+
+[tool.poetry.scripts]
+test_star = "adaptive_clearing_test.test_star:main"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
